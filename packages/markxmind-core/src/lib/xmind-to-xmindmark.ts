@@ -43,7 +43,7 @@ export async function parseXMindToXMindMarkFile(
     xmindFile: ArrayBuffer,
     targetSheetOrder: number = 0
 ): Promise<XMindMarkContent> {
-    const sheets = await tryExtractContentJSON(xmindFile)
+    const sheets = await tryExtractSheets(xmindFile)
 
     return sheets && sheets[targetSheetOrder]
         ? xmindMarkFrom(sheets[targetSheetOrder])
@@ -166,18 +166,197 @@ function traverseBranch(
 // File loader
 //
 
-async function tryExtractContentJSON(
+async function tryExtractSheets(
     file: ArrayBuffer
 ): Promise<SheetModel[] | null> {
     try {
         const zip = await new JSZip().loadAsync(file)
         const contentJSON = await zip.file("content.json")?.async("string")
+        if (contentJSON) return JSON.parse(contentJSON) as SheetModel[]
 
-        return JSON.parse(contentJSON ?? "") as SheetModel[]
+        const contentXML = await zip.file("content.xml")?.async("string")
+        return contentXML ? parseLegacyContentXML(contentXML) : null
     } catch (e) {
         console.error("Not valid .xmind file.")
         return null
     }
+}
+
+type XMLElement = {
+    name: string
+    attributes: Record<string, string>
+    children: XMLElement[]
+    text: string[]
+}
+
+function parseLegacyContentXML(contentXML: string): SheetModel[] {
+    const documentNode = parseXMLDocument(contentXML)
+    const sheets = findDescendants(documentNode, "sheet")
+    let generatedId = 0
+
+    const nextId = () => `legacy-xmind-${generatedId++}`
+
+    return sheets
+        .map((sheet, index): SheetModel | null => {
+            const rootTopic = childElements(sheet, "topic")[0]
+            if (!rootTopic) return null
+
+            return {
+                id: sheet.attributes.id ?? nextId(),
+                class: "sheet",
+                title:
+                    textContent(childElements(sheet, "title")[0]) ||
+                    `Map ${index + 1}`,
+                rootTopic: topicFromLegacyXML(rootTopic, nextId),
+                topicPositioning: "fixed",
+                relationships: []
+            }
+        })
+        .filter((sheet): sheet is SheetModel => sheet !== null)
+}
+
+function topicFromLegacyXML(
+    topic: XMLElement,
+    nextId: () => string
+): TopicModel {
+    const model: TopicModel = {
+        id: topic.attributes.id ?? nextId(),
+        class: "topic",
+        title: textContent(childElements(topic, "title")[0]),
+        titleUnedited: true
+    }
+    const structureClass = topic.attributes["structure-class"]
+    const { branch } = topic.attributes
+
+    if (structureClass) model.structureClass = structureClass
+    if (branch) model.branch = branch
+
+    const children = childElements(topic, "children")[0]
+    const attached = children
+        ? childElements(children, "topics")
+              .filter((topics) => topics.attributes.type === "attached")
+              .flatMap((topics) => childElements(topics, "topic"))
+              .map((child) => topicFromLegacyXML(child, nextId))
+        : []
+
+    if (attached.length > 0) {
+        model.children = { attached }
+    }
+
+    return model
+}
+
+function parseXMLDocument(contentXML: string): XMLElement {
+    const documentNode = makeXMLElement("#document", {})
+    const stack = [documentNode]
+    const tokenRE =
+        /<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<[^>]+>|[^<]+/g
+    let match: RegExpExecArray | null
+
+    while ((match = tokenRE.exec(contentXML))) {
+        const token = match[0]
+        const parent = stack[stack.length - 1]
+
+        if (token.startsWith("<!--") || token.startsWith("<?")) continue
+        if (token.startsWith("<![CDATA[")) {
+            parent.text.push(token.slice(9, -3))
+            continue
+        }
+        if (token.startsWith("</")) {
+            stack.pop()
+            continue
+        }
+        if (token.startsWith("<!")) continue
+        if (token.startsWith("<")) {
+            const selfClosing = token.endsWith("/>")
+            const content = token.slice(1, selfClosing ? -2 : -1).trim()
+            const firstSpace = content.search(/\s/)
+            const name =
+                firstSpace === -1 ? content : content.slice(0, firstSpace)
+            const attributes =
+                firstSpace === -1
+                    ? {}
+                    : parseXMLAttributes(content.slice(firstSpace + 1))
+            const element = makeXMLElement(name, attributes)
+
+            parent.children.push(element)
+            if (!selfClosing) stack.push(element)
+            continue
+        }
+
+        parent.text.push(decodeXMLText(token))
+    }
+
+    return documentNode
+}
+
+function makeXMLElement(
+    name: string,
+    attributes: Record<string, string>
+): XMLElement {
+    return {
+        name,
+        attributes,
+        children: [],
+        text: []
+    }
+}
+
+function parseXMLAttributes(source: string): Record<string, string> {
+    const attributes: Record<string, string> = {}
+    const attrRE = /([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g
+    let match: RegExpExecArray | null
+
+    while ((match = attrRE.exec(source))) {
+        attributes[match[1]] = decodeXMLText(match[2] ?? match[3] ?? "")
+    }
+
+    return attributes
+}
+
+function childElements(element: XMLElement, name: string): XMLElement[] {
+    return element.children.filter((child) => localName(child.name) === name)
+}
+
+function findDescendants(element: XMLElement, name: string): XMLElement[] {
+    const matches = localName(element.name) === name ? [element] : []
+
+    return element.children.reduce<XMLElement[]>(
+        (result, child) => result.concat(findDescendants(child, name)),
+        matches
+    )
+}
+
+function textContent(element?: XMLElement): string {
+    if (!element) return ""
+
+    return element.text
+        .concat(element.children.map((child) => textContent(child)))
+        .join("")
+        .replace(/\s+/g, " ")
+        .trim()
+}
+
+function localName(name: string): string {
+    const index = name.indexOf(":")
+    return index === -1 ? name : name.slice(index + 1)
+}
+
+function decodeXMLText(text: string): string {
+    return text.replace(
+        /&(#x[\da-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g,
+        (_entity, value: string) => {
+            if (value === "amp") return "&"
+            if (value === "lt") return "<"
+            if (value === "gt") return ">"
+            if (value === "quot") return '"'
+            if (value === "apos") return "'"
+            if (value.startsWith("#x")) {
+                return String.fromCodePoint(parseInt(value.slice(2), 16))
+            }
+            return String.fromCodePoint(parseInt(value.slice(1), 10))
+        }
+    )
 }
 
 ///////////////////////////////////////////
