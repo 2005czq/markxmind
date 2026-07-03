@@ -233,12 +233,21 @@ function initView() {
             openedFileName = file.name.split(".")[0]
             input.classList.add("loading")
 
-            const result = await loadFileAsText(file)
-            globalThis.editor.setValue(result)
-            saveEditorContent(result)
-            renderMapByString(result)
-            input.classList.remove("loading")
-            fileSelect.files = null
+            try {
+                const result = await loadFileAsText(file)
+                globalThis.editor.setValue(result)
+                saveEditorContent(result)
+                renderMapByString(result)
+            } catch (error) {
+                alert(
+                    error instanceof Error
+                        ? error.message
+                        : "Failed to load file."
+                )
+            } finally {
+                input.classList.remove("loading")
+                fileSelect.value = ""
+            }
         }
     })
 

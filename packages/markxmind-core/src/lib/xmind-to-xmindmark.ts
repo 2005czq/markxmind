@@ -38,12 +38,21 @@ type TopicScope = BranchScope & {
 type TopicScopeObserver = (scope: TopicScope) => void
 type BranchScopeObserver = (scope: BranchScope) => void
 type ClosedRange = `(${number},${number})`
+type LegacyXMLTag = {
+    readonly name: string
+    readonly attributes: Record<string, string>
+    readonly isClosing: boolean
+    readonly isSelfClosing: boolean
+}
+type LegacySheetModel = Omit<SheetModel, "rootTopic"> & {
+    rootTopic?: TopicModel
+}
 
 export async function parseXMindToXMindMarkFile(
     xmindFile: ArrayBuffer,
     targetSheetOrder: number = 0
 ): Promise<XMindMarkContent> {
-    const sheets = await tryExtractContentJSON(xmindFile)
+    const sheets = await tryExtractXMindContent(xmindFile)
 
     return sheets && sheets[targetSheetOrder]
         ? xmindMarkFrom(sheets[targetSheetOrder])
@@ -166,18 +175,153 @@ function traverseBranch(
 // File loader
 //
 
-async function tryExtractContentJSON(
+async function tryExtractXMindContent(
     file: ArrayBuffer
 ): Promise<SheetModel[] | null> {
     try {
         const zip = await new JSZip().loadAsync(file)
         const contentJSON = await zip.file("content.json")?.async("string")
+        if (contentJSON) return JSON.parse(contentJSON) as SheetModel[]
 
-        return JSON.parse(contentJSON ?? "") as SheetModel[]
+        const contentXML = await zip.file("content.xml")?.async("string")
+        return contentXML ? parseLegacyContentXML(contentXML) : null
     } catch (e) {
         console.error("Not valid .xmind file.")
         return null
     }
+}
+
+function parseLegacyContentXML(xml: string): SheetModel[] {
+    const sheets: LegacySheetModel[] = []
+    const topicStack: TopicModel[] = []
+    const topicsTypeStack: TopicType[] = []
+    let currentSheet: LegacySheetModel | undefined
+    let titleTarget: TopicModel | LegacySheetModel | undefined
+    let titleBuffer = ""
+
+    for (const token of xml.match(/<!\[CDATA\[[\s\S]*?\]\]>|<[^>]+>|[^<]+/g) ??
+        []) {
+        if (token.startsWith("<![CDATA[")) {
+            if (titleTarget) titleBuffer += token.slice(9, -3)
+            continue
+        }
+
+        if (!token.startsWith("<")) {
+            if (titleTarget) titleBuffer += decodeXMLText(token)
+            continue
+        }
+
+        if (token.startsWith("<?") || token.startsWith("<!--")) continue
+
+        const tag = parseLegacyXMLTag(token)
+        if (!tag) continue
+
+        if (tag.isClosing) {
+            if (tag.name === "topic") {
+                topicStack.pop()
+            } else if (tag.name === "topics") {
+                topicsTypeStack.pop()
+            } else if (tag.name === "title" && titleTarget) {
+                titleTarget.title = titleBuffer.trim()
+                titleTarget = undefined
+                titleBuffer = ""
+            } else if (tag.name === "sheet") {
+                currentSheet = undefined
+            }
+            continue
+        }
+
+        if (tag.name === "sheet") {
+            currentSheet = {
+                id: tag.attributes.id ?? "",
+                class: "sheet",
+                title: "",
+                topicPositioning: "",
+                relationships: []
+            }
+            sheets.push(currentSheet)
+        } else if (tag.name === "topics") {
+            topicsTypeStack.push(toTopicType(tag.attributes.type))
+        } else if (tag.name === "topic" && currentSheet) {
+            const topic = createLegacyTopic(tag.attributes)
+            const parentTopic = topicStack[topicStack.length - 1]
+            const topicType = topicsTypeStack[topicsTypeStack.length - 1]
+
+            if (parentTopic) {
+                parentTopic.children ??= {}
+                parentTopic.children[topicType] ??= []
+                parentTopic.children[topicType]?.push(topic)
+            } else {
+                currentSheet.rootTopic = topic
+            }
+
+            if (!tag.isSelfClosing) topicStack.push(topic)
+        } else if (tag.name === "title") {
+            titleTarget = topicStack[topicStack.length - 1] ?? currentSheet
+            titleBuffer = ""
+        }
+
+        if (tag.isSelfClosing && tag.name === "topics") topicsTypeStack.pop()
+    }
+
+    return sheets.filter((sheet): sheet is SheetModel =>
+        Boolean(sheet.rootTopic)
+    )
+}
+
+function parseLegacyXMLTag(token: string): LegacyXMLTag | null {
+    const isClosing = token.startsWith("</")
+    const isSelfClosing = token.endsWith("/>")
+    const content = token
+        .slice(isClosing ? 2 : 1, isSelfClosing ? -2 : -1)
+        .trim()
+    const name = content
+        .match(/^([^\s/>]+)/)?.[1]
+        ?.split(":")
+        .pop()
+    if (!name) return null
+
+    return {
+        name,
+        attributes: parseLegacyXMLAttributes(content),
+        isClosing,
+        isSelfClosing
+    }
+}
+
+function parseLegacyXMLAttributes(content: string): Record<string, string> {
+    const attributes: Record<string, string> = {}
+    const attributePattern = /([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g
+    let match: RegExpExecArray | null
+
+    while ((match = attributePattern.exec(content))) {
+        attributes[match[1]] = decodeXMLText(match[2] ?? match[3] ?? "")
+    }
+
+    return attributes
+}
+
+function decodeXMLText(text: string): string {
+    return text
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, "&")
+}
+
+function createLegacyTopic(attributes: Record<string, string>): TopicModel {
+    return {
+        id: attributes.id ?? "",
+        title: "",
+        branch: attributes.branch,
+        structureClass: attributes["structure-class"],
+        href: attributes["xlink:href"] ?? attributes.href
+    }
+}
+
+function toTopicType(type?: string): TopicType {
+    return type === "detached" || type === "summary" ? type : "attached"
 }
 
 ///////////////////////////////////////////
